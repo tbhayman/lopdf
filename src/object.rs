@@ -1,6 +1,6 @@
 use crate::encodings;
-use crate::encodings::cmap::ToUnicodeCMap;
 use crate::encodings::Encoding;
+use crate::encodings::cmap::ToUnicodeCMap;
 use crate::error::DecompressError;
 use crate::{Document, Error, Result};
 use indexmap::IndexMap;
@@ -433,9 +433,7 @@ impl Dictionary {
             }
             Ok(name) => Ok(Encoding::SimpleEncoding(name)),
             Err(err) => {
-                warn!(
-                    "Could not parse the encoding, error: {err:#?}\nFont: {self:#?}\nTrying to retrieve ToUnicode."
-                );
+                warn!("Could not parse the encoding, error: {err:#?}\nFont: {self:#?}\nTrying to retrieve ToUnicode.");
                 let stream = self.get_deref(b"ToUnicode", doc).and_then(Object::as_stream);
                 if let Ok(stream) = stream {
                     return self.get_encoding_from_to_unicode_cmap(stream);
@@ -626,17 +624,31 @@ impl Stream {
     }
 
     pub fn filters(&self) -> Result<Vec<&[u8]>> {
-        let filter = self.dict.get(b"Filter")?;
-
-        if let Ok(name) = filter.as_name() {
-            Ok(vec![name])
-        } else if let Ok(names) = filter.as_array() {
-            names.iter().map(Object::as_name).collect()
-        } else {
-            Err(Error::ObjectType {
-                expected: "Name or Array",
-                found: filter.enum_variant(),
-            })
+        match self.dict.get(b"Filter") {
+            Ok(filter) => {
+                if let Ok(name) = filter.as_name() {
+                    Ok(vec![name])
+                } else if let Ok(names) = filter.as_array() {
+                    names.iter().map(Object::as_name).collect()
+                } else {
+                    Err(Error::ObjectType {
+                        expected: "Name or Array",
+                        found: filter.enum_variant(),
+                    })
+                }
+            }
+            Err(_) => {
+                // PDF spec (ISO 32000-1, section 7.5.7): Object streams SHALL be encoded with FlateDecode
+                // If no Filter is specified for an ObjStm, assume FlateDecode
+                if let Ok(stream_type) = self.dict.get(b"Type") {
+                    if let Ok(type_name) = stream_type.as_name() {
+                        if type_name == b"ObjStm" {
+                            return Ok(vec![b"FlateDecode"]);
+                        }
+                    }
+                }
+                Err(Error::DictKey("Filter".to_string()))
+            }
         }
     }
 
@@ -660,8 +672,8 @@ impl Stream {
     }
 
     pub fn compress(&mut self) -> Result<()> {
-        use flate2::write::ZlibEncoder;
         use flate2::Compression;
+        use flate2::write::ZlibEncoder;
         use std::io::prelude::*;
 
         if self.dict.get(b"Filter").is_err() {
@@ -697,7 +709,7 @@ impl Stream {
     }
 
     fn decompress_lzw(input: &[u8], params: Option<&Dictionary>) -> Result<Vec<u8>> {
-        use weezl::{decode::Decoder, BitOrder};
+        use weezl::{BitOrder, decode::Decoder};
         const MIN_BITS: u8 = 9;
 
         let early_change = params
@@ -735,10 +747,14 @@ impl Stream {
         let mut decoder = ZlibDecoder::new(input);
 
         if !input.is_empty() {
-            decoder.read_to_end(&mut output).unwrap_or_else(|err| {
-                warn!("{err}");
-                0
-            });
+            match decoder.read_to_end(&mut output) {
+                Ok(_) => {}
+                Err(err) => {
+                    warn!("Zlib decompression error: {}", err);
+                    // Return error instead of silently producing empty output
+                    return Err(Error::Decompress(DecompressError::Flate(err.to_string())));
+                }
+            }
         }
         Self::decompress_predictor(output, params)
     }
@@ -831,7 +847,7 @@ impl Stream {
 
 #[cfg(test)]
 mod test {
-    use crate::{error::DecompressError, Error};
+    use crate::{Error, error::DecompressError};
 
     use super::Stream;
 
